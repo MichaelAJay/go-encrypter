@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/MichaelAJay/go-encrypter/encrypter"
+	"go-encrypter"
 )
 
 func main() {
