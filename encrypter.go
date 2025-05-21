@@ -20,7 +20,9 @@ import (
 // Encrypter provides encryption and decryption services
 type Encrypter interface {
 	Encrypt(data []byte) ([]byte, error)
+	EncryptWithAAD(data, additionalData []byte) ([]byte, error)
 	Decrypt(data []byte) ([]byte, error)
+	DecryptWithAAD(data, additionalData []byte) ([]byte, error)
 	HashPassword(password []byte) ([]byte, error)
 	VerifyPassword(hashedPassword, password []byte) (bool, error)
 	HashLookupData(data []byte) []byte
@@ -42,15 +44,39 @@ type AESEncrypter struct {
 
 func DefaultArgonParams() ArgonParams {
 	return ArgonParams{
-		Memory:     65536, // 64MB
-		Iterations: 1,     // Following Argon2 recommendation
+		Memory:     131072, // 128MB
+		Iterations: 1,      // Following Argon2 recommendation
 		Threads:    4,
 		SaltLength: 16,
 		KeyLength:  32,
 	}
 }
 
+// ValidateArgonParams checks if Argon2 parameters meet minimum security requirements
+func ValidateArgonParams(params ArgonParams) error {
+	if params.Memory < 32768 {
+		return errors.New("memory parameter too low, minimum 32MB (32768) recommended")
+	}
+	if params.Iterations < 1 {
+		return errors.New("iterations parameter must be at least 1")
+	}
+	if params.Threads < 1 {
+		return errors.New("threads parameter must be at least 1")
+	}
+	if params.SaltLength < 16 {
+		return errors.New("salt length must be at least 16 bytes")
+	}
+	if params.KeyLength < 16 {
+		return errors.New("key length must be at least 16 bytes")
+	}
+	return nil
+}
+
 func NewAESEncrypter(key []byte) (*AESEncrypter, error) {
+	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
+		return nil, errors.New("key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256")
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -61,14 +87,27 @@ func NewAESEncrypter(key []byte) (*AESEncrypter, error) {
 		return nil, err
 	}
 
+	params := DefaultArgonParams()
+	if err := ValidateArgonParams(params); err != nil {
+		return nil, err
+	}
+
 	return &AESEncrypter{
 		gcm:         gcm,
 		key:         key,
-		argonParams: DefaultArgonParams(),
+		argonParams: params,
 	}, nil
 }
 
 func NewAESEncrypterWithArgonParams(key []byte, argonParams ArgonParams) (*AESEncrypter, error) {
+	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
+		return nil, errors.New("key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256")
+	}
+
+	if err := ValidateArgonParams(argonParams); err != nil {
+		return nil, err
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -86,20 +125,30 @@ func NewAESEncrypterWithArgonParams(key []byte, argonParams ArgonParams) (*AESEn
 	}, nil
 }
 
-// Encrypt encrypts plaintext using AES-GCM
+// Encrypt encrypts plaintext using AES-GCM without additional data
 func (e *AESEncrypter) Encrypt(plaintext []byte) ([]byte, error) {
+	return e.EncryptWithAAD(plaintext, nil)
+}
+
+// EncryptWithAAD encrypts plaintext using AES-GCM with additional authenticated data
+func (e *AESEncrypter) EncryptWithAAD(plaintext, additionalData []byte) ([]byte, error) {
 	nonce := make([]byte, e.gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, err
 	}
 
 	// Encrypt and append nonce
-	ciphertext := e.gcm.Seal(nonce, nonce, plaintext, nil)
+	ciphertext := e.gcm.Seal(nonce, nonce, plaintext, additionalData)
 	return ciphertext, nil
 }
 
-// Decrypt decrypts ciphertext using AES-GCM
+// Decrypt decrypts ciphertext using AES-GCM without additional data
 func (e *AESEncrypter) Decrypt(ciphertext []byte) ([]byte, error) {
+	return e.DecryptWithAAD(ciphertext, nil)
+}
+
+// DecryptWithAAD decrypts ciphertext using AES-GCM with additional authenticated data
+func (e *AESEncrypter) DecryptWithAAD(ciphertext, additionalData []byte) ([]byte, error) {
 	nonceSize := e.gcm.NonceSize()
 	if len(ciphertext) < nonceSize {
 		return nil, errors.New("ciphertext too short")
@@ -109,7 +158,7 @@ func (e *AESEncrypter) Decrypt(ciphertext []byte) ([]byte, error) {
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
 
 	// Decrypt
-	plaintext, err := e.gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := e.gcm.Open(nil, nonce, ciphertext, additionalData)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +182,7 @@ func (e *AESEncrypter) HashPassword(password []byte) ([]byte, error) {
 		e.argonParams.KeyLength,
 	)
 
-	// Format: $argon2id$v=19$m=65536,t=1,p=4$salt$hash
+	// Format: $argon2id$v=19$m={memory},t={iterations},p={threads}${base64salt}${base64hash}
 	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64Hash := base64.RawStdEncoding.EncodeToString(hash)
 
@@ -156,38 +205,79 @@ func (e *AESEncrypter) VerifyPassword(hashedPassword, password []byte) (bool, er
 		return false, errors.New("invalid hashed password format")
 	}
 
-	version := parts[1]
+	if parts[1] != "argon2id" {
+		return false, errors.New("unsupported hash algorithm")
+	}
+
+	var version string
+	if !strings.HasPrefix(parts[2], "v=") {
+		return false, errors.New("invalid version format")
+	}
+	version = strings.TrimPrefix(parts[2], "v=")
 	if version != "19" {
 		return false, errors.New("unsupported argon2 version")
 	}
 
-	memory, err := strconv.ParseUint(parts[2], 10, 32)
+	// Parse parameters
+	if !strings.HasPrefix(parts[3], "m=") {
+		return false, errors.New("invalid parameters format")
+	}
+
+	paramsStr := strings.TrimPrefix(parts[3], "m=")
+	paramsParts := strings.Split(paramsStr, ",")
+	if len(paramsParts) != 3 {
+		return false, errors.New("invalid parameters count")
+	}
+
+	// Parse memory
+	memoryStr := paramsParts[0]
+	memory, err := strconv.ParseUint(memoryStr, 10, 32)
 	if err != nil {
 		return false, errors.New("invalid memory parameter")
 	}
 
-	iterations, err := strconv.ParseUint(parts[3], 10, 32)
+	// Parse iterations
+	if !strings.HasPrefix(paramsParts[1], "t=") {
+		return false, errors.New("invalid iterations format")
+	}
+	iterationsStr := strings.TrimPrefix(paramsParts[1], "t=")
+	iterations, err := strconv.ParseUint(iterationsStr, 10, 32)
 	if err != nil {
 		return false, errors.New("invalid iterations parameter")
 	}
 
-	threads, err := strconv.ParseUint(parts[4], 10, 8)
+	// Parse threads
+	if !strings.HasPrefix(paramsParts[2], "p=") {
+		return false, errors.New("invalid threads format")
+	}
+	threadsStr := strings.TrimPrefix(paramsParts[2], "p=")
+	threads, err := strconv.ParseUint(threadsStr, 10, 8)
 	if err != nil {
 		return false, errors.New("invalid threads parameter")
 	}
 
-	salt, err := base64.RawStdEncoding.DecodeString(parts[5])
+	// Decode salt and hash
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {
-		return false, errors.New("invalid salt")
+		return false, errors.New("invalid salt encoding")
 	}
 
-	decodedHash, err := base64.RawStdEncoding.DecodeString(parts[6])
+	decodedHash, err := base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil {
-		return false, errors.New("invalid hash")
+		return false, errors.New("invalid hash encoding")
 	}
 
-	computedHash := argon2.IDKey(password, salt, uint32(iterations), uint32(memory), uint8(threads), uint32(len(decodedHash)))
+	// Compute hash with the same parameters
+	computedHash := argon2.IDKey(
+		password,
+		salt,
+		uint32(iterations),
+		uint32(memory),
+		uint8(threads),
+		uint32(len(decodedHash)),
+	)
 
+	// Compare hashes in constant time to prevent timing attacks
 	return subtle.ConstantTimeCompare(decodedHash, computedHash) == 1, nil
 }
 
