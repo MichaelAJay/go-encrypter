@@ -1,4 +1,4 @@
-module go-encrypter
+module github.com/MichaelAJay/go-encrypter
 
 go 1.23.3
 
