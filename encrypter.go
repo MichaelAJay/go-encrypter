@@ -13,7 +13,9 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/MichaelAJay/go-logger"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -26,6 +28,7 @@ type Encrypter interface {
 	HashPassword(password []byte) ([]byte, error)
 	VerifyPassword(hashedPassword, password []byte) (bool, error)
 	HashLookupData(data []byte) []byte
+	GetKeyVersion() string
 }
 
 type ArgonParams struct {
@@ -37,8 +40,10 @@ type ArgonParams struct {
 }
 
 type AESEncrypter struct {
+	logger      logger.Logger
 	gcm         cipher.AEAD
 	key         []byte
+	keyVersion  string
 	argonParams ArgonParams
 }
 
@@ -73,35 +78,36 @@ func ValidateArgonParams(params ArgonParams) error {
 }
 
 func NewAESEncrypter(key []byte) (*AESEncrypter, error) {
-	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
-		return nil, errors.New("key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256")
-	}
+	return NewAESEncrypterWithVersion(key, "v1")
+}
 
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	params := DefaultArgonParams()
-	if err := ValidateArgonParams(params); err != nil {
-		return nil, err
-	}
-
-	return &AESEncrypter{
-		gcm:         gcm,
-		key:         key,
-		argonParams: params,
-	}, nil
+func NewAESEncrypterWithVersion(key []byte, keyVersion string) (*AESEncrypter, error) {
+	return NewAESEncrypterWithArgonParamsAndVersion(key, DefaultArgonParams(), keyVersion)
 }
 
 func NewAESEncrypterWithArgonParams(key []byte, argonParams ArgonParams) (*AESEncrypter, error) {
+	return NewAESEncrypterWithArgonParamsAndVersion(key, argonParams, "v1")
+}
+
+func NewAESEncrypterWithLogger(key []byte, keyVersion string, log logger.Logger) (*AESEncrypter, error) {
+	return NewAESEncrypterComplete(key, DefaultArgonParams(), keyVersion, log)
+}
+
+// NewAESEncrypterWithArgonParamsAndVersion creates a new AES encrypter with full configuration
+// Production Best Practice: Always specify key version for operational visibility and key rotation
+func NewAESEncrypterWithArgonParamsAndVersion(key []byte, argonParams ArgonParams, keyVersion string) (*AESEncrypter, error) {
+	return NewAESEncrypterComplete(key, argonParams, keyVersion, nil)
+}
+
+// NewAESEncrypterComplete creates a new AES encrypter with all configuration options
+// This is the most complete constructor - all others delegate to this one
+func NewAESEncrypterComplete(key []byte, argonParams ArgonParams, keyVersion string, log logger.Logger) (*AESEncrypter, error) {
 	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
 		return nil, errors.New("key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256")
+	}
+
+	if keyVersion == "" {
+		return nil, errors.New("key version cannot be empty")
 	}
 
 	if err := ValidateArgonParams(argonParams); err != nil {
@@ -119,8 +125,10 @@ func NewAESEncrypterWithArgonParams(key []byte, argonParams ArgonParams) (*AESEn
 	}
 
 	return &AESEncrypter{
+		logger:      log,
 		gcm:         gcm,
 		key:         key,
+		keyVersion:  keyVersion,
 		argonParams: argonParams,
 	}, nil
 }
@@ -144,7 +152,27 @@ func (e *AESEncrypter) EncryptWithAAD(plaintext, additionalData []byte) ([]byte,
 
 // Decrypt decrypts ciphertext using AES-GCM without additional data
 func (e *AESEncrypter) Decrypt(ciphertext []byte) ([]byte, error) {
-	return e.DecryptWithAAD(ciphertext, nil)
+	start := time.Now()
+	defer func() {
+		if e.logger != nil {
+			e.logger.Debug("Decrypt operation completed",
+				logger.Field{Key: "duration", Value: time.Since(start)},
+				logger.Field{Key: "key_version", Value: e.keyVersion},
+			)
+		}
+	}()
+
+	result, err := e.DecryptWithAAD(ciphertext, nil)
+	if err != nil && e.logger != nil {
+		e.logger.Error("Decryption failed at crypto layer",
+			logger.Field{Key: "data_length", Value: len(ciphertext)},
+			logger.Field{Key: "key_version", Value: e.keyVersion},
+			logger.Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+			logger.Field{Key: "error", Value: err.Error()},
+		)
+	}
+
+	return result, err
 }
 
 // DecryptWithAAD decrypts ciphertext using AES-GCM with additional authenticated data
@@ -286,4 +314,66 @@ func (e *AESEncrypter) HashLookupData(data []byte) []byte {
 	h := hmac.New(sha256.New, e.key)
 	h.Write(data)
 	return h.Sum(nil)
+}
+
+// SetLogger sets the logger for the encrypter
+// Production Best Practice: Always set a logger for encryption operations monitoring
+func (e *AESEncrypter) SetLogger(logger logger.Logger) {
+	e.logger = logger
+}
+
+// HasLogger returns true if a logger is already set
+func (e *AESEncrypter) HasLogger() bool {
+	return e.logger != nil
+}
+
+// GetKeyVersion returns the current key version
+// This enables key rotation tracking and audit compliance
+func (e *AESEncrypter) GetKeyVersion() string {
+	return e.keyVersion
+}
+
+// RotateKey performs key rotation by creating a new encrypter with a new key and version
+// Production Best Practice: This enables zero-downtime key rotation
+func (e *AESEncrypter) RotateKey(newKey []byte, newVersion string) (*AESEncrypter, error) {
+	if e.logger != nil {
+		e.logger.Info("Initiating key rotation",
+			logger.Field{Key: "old_version", Value: e.keyVersion},
+			logger.Field{Key: "new_version", Value: newVersion},
+		)
+	}
+
+	// Use the complete constructor to include the current logger
+	newEncrypter, err := NewAESEncrypterComplete(newKey, e.argonParams, newVersion, e.logger)
+	if err != nil {
+		if e.logger != nil {
+			e.logger.Error("Key rotation failed",
+				logger.Field{Key: "old_version", Value: e.keyVersion},
+				logger.Field{Key: "new_version", Value: newVersion},
+				logger.Field{Key: "error", Value: err.Error()},
+			)
+		}
+		return nil, err
+	}
+
+	if e.logger != nil {
+		e.logger.Info("Key rotation completed successfully",
+			logger.Field{Key: "old_version", Value: e.keyVersion},
+			logger.Field{Key: "new_version", Value: newVersion},
+		)
+	}
+
+	return newEncrypter, nil
+}
+
+// GetKeyMetadata returns metadata about the current key for monitoring and audit
+func (e *AESEncrypter) GetKeyMetadata() map[string]interface{} {
+	return map[string]interface{}{
+		"version":          e.keyVersion,
+		"key_length":       len(e.key),
+		"algorithm":        "AES-GCM",
+		"argon_memory":     e.argonParams.Memory,
+		"argon_iterations": e.argonParams.Iterations,
+		"argon_threads":    e.argonParams.Threads,
+	}
 }
