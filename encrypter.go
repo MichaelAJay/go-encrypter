@@ -317,7 +317,6 @@ func (e *AESEncrypter) HashLookupData(data []byte) []byte {
 }
 
 // SetLogger sets the logger for the encrypter
-// Production Best Practice: Always set a logger for encryption operations monitoring
 func (e *AESEncrypter) SetLogger(logger logger.Logger) {
 	e.logger = logger
 }
@@ -367,8 +366,8 @@ func (e *AESEncrypter) RotateKey(newKey []byte, newVersion string) (*AESEncrypte
 }
 
 // GetKeyMetadata returns metadata about the current key for monitoring and audit
-func (e *AESEncrypter) GetKeyMetadata() map[string]interface{} {
-	return map[string]interface{}{
+func (e *AESEncrypter) GetKeyMetadata() map[string]any {
+	return map[string]any{
 		"version":          e.keyVersion,
 		"key_length":       len(e.key),
 		"algorithm":        "AES-GCM",

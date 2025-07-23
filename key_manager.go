@@ -198,11 +198,11 @@ func (km *KeyManager) GetCurrentVersion() string {
 }
 
 // GetKeyMetadata returns metadata for all keys
-func (km *KeyManager) GetKeyMetadata() map[string]map[string]interface{} {
+func (km *KeyManager) GetKeyMetadata() map[string]map[string]any {
 	km.mu.RLock()
 	defer km.mu.RUnlock()
 
-	metadata := make(map[string]map[string]interface{})
+	metadata := make(map[string]map[string]any)
 	for version, encrypter := range km.keys {
 		metadata[version] = encrypter.GetKeyMetadata()
 		metadata[version]["is_current"] = version == km.currentKey
